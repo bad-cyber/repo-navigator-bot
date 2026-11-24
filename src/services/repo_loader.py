@@ -3,7 +3,7 @@ import logging
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlunparse
+from urllib.parse import quote, urlunparse
 
 import httpx
 
@@ -42,26 +42,34 @@ def _is_relevant_path(rel_path: str) -> bool:
     if rel_path.endswith(".min.js") or rel_path.endswith(".min.css"):
         return False
     return True
-
-
-async def download_and_extract_repo(owner: str, repo: str) -> list[RepoFile]:
-    """Скачивает zip-архив репозитория GitHub напрямую в память и извлекает файлы с кодом."""
+async def download_and_extract_repo(
+    owner: str,
+    repo: str,
+    branch: str | None = None,
+) -> tuple[list[RepoFile], str]:
+    """Скачивает zip-архив репозитория GitHub в память и возвращает (файлы, ветка)."""
     max_bytes = settings.max_repo_zip_mb * 1024 * 1024
-    headers = {"User-Agent": "RepoNavigatorBot/0.1"}
+    headers = {"User-Agent": "RepoNavigatorBot/0.2"}
     scheme = "http" + "s"
+    branches_to_try = (branch,) if branch else ("main", "master")
 
     resp = None
+    resolved_branch = ""
     async with httpx.AsyncClient(trust_env=False, follow_redirects=True, timeout=30.0) as client:
-        for branch in ("main", "master"):
-            zip_url = urlunparse(
-                (scheme, "github.com", f"/{owner}/{repo}/archive/refs/heads/{branch}.zip", "", "", "")
-            )
-            logger.info("Запрос архива ветки '%s': %r", branch, zip_url)
+        for candidate_branch in branches_to_try:
+            encoded_branch = quote(candidate_branch, safe="/")
+            zip_path = f"/{owner}/{repo}/archive/refs/heads/{encoded_branch}.zip"
+            zip_url = urlunparse((scheme, "github.com", zip_path, "", "", ""))
+            logger.info("Запрос архива ветки '%s': %r", candidate_branch, zip_url)
             candidate = await client.get(zip_url, headers=headers)
             if candidate.status_code == 200:
                 resp = candidate
+                resolved_branch = candidate_branch
                 break
+
     if resp is None:
+        if branch:
+            raise ValueError(f"Репозиторий не найден, он приватный или ветка '{branch}' не существует.")
         raise ValueError("Репозиторий не найден, он приватный или ветка отличается от main/master.")
     if len(resp.content) > max_bytes:
         raise ValueError(f"Архив репозитория превышает лимит {settings.max_repo_zip_mb} МБ.")
@@ -91,5 +99,11 @@ async def download_and_extract_repo(owner: str, repo: str) -> list[RepoFile]:
             if len(extracted_files) >= settings.max_files_per_repo:
                 break
 
-    logger.info("Извлечено релевантных файлов из %s/%s: %s", owner, repo, len(extracted_files))
-    return extracted_files
+    logger.info(
+        "Извлечено релевантных файлов из %s/%s (%s): %s",
+        owner,
+        repo,
+        resolved_branch,
+        len(extracted_files),
+    )
+    return extracted_files, resolved_branch

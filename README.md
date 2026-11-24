@@ -1,36 +1,48 @@
-# Repo Navigator Bot (`v0.1.0`)
+# Repo Navigator Bot (`v0.2.0`)
 
-Telegram-бот для семантического поиска и Q&A по кодовой базе публичных GitHub-репозиториев на базе **Codebase RAG** (AST-чанкинг, векторный поиск, нейросетевой реранкинг и ответы LLM со ссылками на конкретные файлы и строки кода).
+Telegram-бот для семантического поиска, Q&A и базового аудита безопасности по кодовой базе публичных GitHub-репозиториев на базе **Codebase RAG** (AST-чанкинг, векторный поиск, нейросетевой реранкинг, статический сканер рисков и ответы LLM со ссылками на конкретные файлы и строки кода).
 
-## Архитектура (Codebase RAG Pipeline)
+## Архитектура (Codebase RAG & Security Pipeline)
 
 ```mermaid
 flowchart TD
-    U[Пользователь в Telegram] -->|1. Ссылка на GitHub| B[aiogram 3 Bot + Security Guard]
-    B -->|2. Валидация URL и скачивание ZIP в RAM| L[Repo Loader + Zip Bomb Protection]
-    L -->|3. Синтаксический разбор| C[AST Chunker: tree-sitter + Line Fallback]
+    U[Пользователь в Telegram] -->|1. Ссылка на GitHub /tree/branch| B[aiogram 3 Bot + Security Guard]
+    B -->|2. Валидация URL и скачивание ZIP в RAM| L[Repo Loader + Branch Resolver]
+    L -->|3. Статический скан и AST-разбор| C[Security Scanner + tree-sitter Chunker]
     C -->|4. Векторизация passage:| E[intfloat/multilingual-e5-small]
     E -->|5. Upsert + TTL 2h| Q[(Qdrant Vector DB)]
 
-    U -->|6. Вопрос по коду| B
+    U -->|6. Вопрос или /audit /tree| B
     B -->|7. Проверка Prompt Injection + RateLimit| R[RAG Engine]
     R -->|8. Bi-Encoder Top-15| Q
     Q -->|9. Кандидаты кода| RR[CrossEncoder Reranker + Code Boost]
-    RR -->|10. Top-4 фрагмента| LLM[OpenRouter API: Free Fallback Chain]
-    LLM -->|11. Ответ с file_path:start-end| U
+    RR -->|10. Top-4 фрагмента + Security Findings| LLM[OpenRouter API: Free Fallback Chain]
+    LLM -->|11. HTML-ответ + Secret Redaction| U
 ```
 
-## Ключевые особенности
+## Ключевые особенности (`v0.2.0`)
 
+- **Поддержка веток GitHub (`/tree/<branch>`):** можно анализировать как дефолтные ветки (`main`/`master`), так и конкретные feature-ветки с точными ссылками на строки кода (`blob/<branch>/path#Lstart-Lend`).
 - **AST-чанкинг исходного кода (`tree-sitter`):** разбивает код на логические единицы (функции, классы, методы, структуры) для Python, JS/TS, Go, Rust, Java, C/C++, C#, PHP, Ruby, сохраняя точные номера строк (`start_line`–`end_line`). Для Markdown, YAML и конфигов используется построчный чанкинг с перекрытием.
+- **Базовый AppSec-аудит (`/audit`) и навигация по структуре (`/tree`):**
+  - Статический сканер проверяет код на опасные конструкции (`eval`/`exec`, `pickle.loads`, `yaml.load`, `os.system`, `shell=True`, потенциальный XSS/SQLi, `verify=False`) и возможные утечки статических ключей.
+  - Гибридный LLM-отчёт объединяет находки статического анализатора с семантически найденными модулями аутентификации и работы с секретами.
 - **Двухэтапный поиск (Retrieve & Rerank):**
   1. Быстрый векторный поиск топ-15 кандидатов в **Qdrant** с помощью мультиязычной модели эмбеддингов `intfloat/multilingual-e5-small`.
   2. Точная пересортировка через `DiTy/cross-encoder-russian-msmarco` с приоритетом исходного кода над документацией (`.md`) и отбором топ-4 фрагментов.
-- **Бесплатный облачный LLM-слой с отказоустойчивостью:** работа через OpenRouter API с автоматическим переключением по цепочке бесплатных моделей при перегрузках (`429`) и резервной выдачей найденных участков кода.
 - **Безопасность и управление памятью:**
   - Валидация GitHub URL (защита от SSRF), фильтрация бинарных и служебных директорий (`node_modules`, `.git`, `.min.js`).
-  - Санитизация Indirect Prompt Injections внутри чужого исходного кода и защита от инъекций в вопросах пользователя.
-  - Автоматическая очистка проиндексированных репозиториев из Qdrant по истечении **2 часов** (`INDEX_TTL_SECONDS=7200`).
+  - Санитизация Indirect Prompt Injections в чужом коде, фильтрация инъекций в вопросах пользователя и маскирование секретов (`redact_secrets`) в ответах бота.
+  - Автоматическая очистка проиндексированных репозиториев и кэша метаданных по истечении **2 часов** (`INDEX_TTL_SECONDS=7200`).
+
+## Команды бота
+
+- Отправка ссылки на GitHub (например, `https://github.com/bad-cyber/repo-navigator-bot` без пробелов) — загрузка и индексация репозитория или выбранной ветки.
+- Любой текстовый вопрос — поиск по кодовой базе с кликабельными ссылками на строки кода.
+- `/tree` — вывод дерева проиндексированных файлов активного репозитория.
+- `/audit` — статический и RAG-аудит безопасности репозитория.
+- `/status` — отображение текущего репозитория и активной ветки.
+- `/help` — справка по командам.
 
 ## Технологический стек
 
@@ -38,14 +50,14 @@ flowchart TD
 - **Code Parsing:** `tree-sitter-language-pack`
 - **ML / Embeddings / Reranker:** `sentence-transformers` (`intfloat/multilingual-e5-small`, `DiTy/cross-encoder-russian-msmarco`)
 - **Vector Database:** `Qdrant` (Docker)
-- **LLM Provider:** OpenRouter API (`openai` Python SDK)
+- **LLM Provider:** OpenRouter API (`openai` Python SDK) с цепочкой fallback-моделей
 - **Testing & CI:** `pytest`, `pytest-asyncio`, GitHub Actions
 
 ## Быстрый старт (локально)
 
 1. **Клонируйте репозиторий и создайте виртуальное окружение:**
    ```bash
-   git clone https: / / github.com / bad-cyber / repo-navigator-bot.git
+   git clone https://github.com/bad-cyber/repo-navigator-bot.git
    cd repo-navigator-bot
    python -m venv .venv
    source .venv/bin/activate  # для Windows: .venv\Scripts\activate
@@ -54,7 +66,7 @@ flowchart TD
 
 2. **Установите зависимости:**
    ```bash
-   pip install torch --index-url https: / / download.pytorch.org / whl / cpu
+   pip install torch --index-url https://download.pytorch.org/whl/cpu
    pip install -r requirements.txt
    ```
 
@@ -69,36 +81,11 @@ flowchart TD
    ```
    Укажите в `.env` ваш `BOT_TOKEN` (от `@BotFather`) и `LLM_API_KEY` (бесплатный ключ OpenRouter).
 
-5. **Запустите бота:**
+5. **Запустите бота и тесты:**
    ```bash
    python -m src.main
+   pytest -v
    ```
-
-## Запуск тестов
-
-```bash
-pytest -v
-```
-
-## Структура проекта
-
-```text
-repo-navigator-bot/
-├── .github/workflows/ci.yml   # CI-пайплайн для автоматического прогона тестов
-├── src/
-│   ├── bot/handlers.py        # Хендлеры Telegram-бота и FSM
-│   ├── services/
-│   │   ├── chunker.py         # AST-парсер (tree-sitter) и построчный чанкер
-│   │   ├── rag_engine.py      # Индексация в Qdrant, реранкинг, TTL и вызов LLM
-│   │   ├── repo_loader.py     # Скачивание и фильтрация ZIP-архивов GitHub в RAM
-│   │   └── security.py        # Защита от SSRF, Prompt Injection и RateLimiter
-│   ├── config.py              # Конфигурация приложения (pydantic-settings)
-│   └── main.py                # Точка входа и прогрев локальных ML-моделей
-├── tests/                     # 50 модульных тестов (security, chunker, loader, rag)
-├── docker-compose.yml         # Контейнер векторной БД Qdrant
-├── Dockerfile                 # Сборка образа бота на CPU PyTorch
-└── requirements.txt           # Зависимости Python
-```
 
 ## Автор и лицензия
 
